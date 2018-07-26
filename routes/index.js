@@ -17,8 +17,12 @@ const router = express.Router();
 const graphHelper = require('../utils/graphHelper.js');
 const emailer = require('../utils/emailer.js');
 const passport = require('passport');
+const request = require('superagent');
+const http = require('http');
 // ////const fs = require('fs');
 // ////const path = require('path');
+
+const clientState = 'patata';
 
 // Get the home page.
 router.get('/', (req, res) => {
@@ -44,6 +48,8 @@ router.get('/token',
     (req, res) => {
       graphHelper.getUserData(req.user.accessToken, (err, user) => {
         if (!err) {
+          requestSubscription(req.user);
+
           req.user.profile.displayName = user.body.displayName;
           req.user.profile.emails = [{ address: user.body.mail || user.body.userPrincipalName }];
           renderSendMail(req, res);
@@ -59,6 +65,111 @@ function renderSendMail(req, res) {
     display_name: req.user.profile.displayName,
     email_address: req.user.profile.emails[0].address
   });
+}
+
+const subscriptions = {};
+
+function requestSubscription(user) {
+  const subcriptionConfig = {
+    changeType: 'created, updated',
+    notificationUrl: 'https://e9c6d0f2.ngrok.io/listen',
+    resource: '/me/events',
+    expirationDateTime: new Date(Date.now() + 86400000).toISOString(),
+    clientState
+  };
+
+  request.post('https://graph.microsoft.com/beta/subscriptions')
+    .set({
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + user.accessToken
+    })
+    .send(subcriptionConfig)
+    .end((err, res) => {
+      if (err) {
+        console.error('Error trying to subscribe to resources: ' + err.message);
+        return;
+      }
+
+      console.log('Subscribed to notifications: ' + JSON.stringify(res.body));
+      subscriptions[res.body.id] = {
+        userToken: user.accessToken
+      };
+    });
+}
+
+/* Default listen route */
+router.post('/listen', (req, res, next) => {
+  let clientStatesValid;
+
+  // If there's a validationToken parameter in the query string,
+  // then this is the request that Office 365 sends to check
+  // that this is a valid endpoint.
+  // Just send the validationToken back.
+  if (req.query && req.query.validationToken) {
+    res.send(req.query.validationToken);
+    // Send a status of 'Ok'
+    res.status(200).end(http.STATUS_CODES[200]);
+  } else {
+    clientStatesValid = false;
+
+    // First, validate all the clientState values in array
+    for (let i = 0; i < req.body.value.length; i++) {
+      if (req.body.value[i].clientState !== clientState) {
+        // If just one clientState is invalid, we discard the whole batch
+        clientStatesValid = false;
+        break;
+      } else {
+        clientStatesValid = true;
+      }
+    }
+
+    // Send a status of 'Accepted'
+    // If the clientState field doesn't have the expected value,
+    // this request might NOT come from Microsoft Graph.
+    // However, you should still return the same status that you'd
+    // return to Microsoft Graph to not alert possible impostors
+    // that you have discovered them.
+    res.status(202).end(http.STATUS_CODES[202]);
+
+    // If all the clientStates are valid, then process the notification
+    if (clientStatesValid) {
+      for (let i = 0; i < req.body.value.length; i++) {
+        const notification = req.body.value[i];
+        processNotification(notification, req);
+      }
+    } 
+  }
+});
+
+// Get subscription data from the database
+// Retrieve the actual event data from Office 365.
+// Send the message data to the socket.
+function processNotification(notification) {
+  const subIds = Object.keys(subscriptions);
+
+  let subscription;
+  for(let i = 0; i < subIds.length; i++) {
+    const id = subIds[i];
+    subscription = id === notification.subscriptionId && subscriptions[id];
+  }
+
+  if (!subscription) {
+    // Receiving subscription from a different session, ignore.
+    return;
+  }
+
+  console.log(`Received ${notification.changeType} notification for resource ${notification.resource}`);
+
+  request.get('https://graph.microsoft.com/beta/' + notification.resource)
+    .set({ Authorization: 'Bearer ' + subscription.userToken })
+    .end((err, res) => {
+      if (err) {
+        console.err('Error requesting event information: ' + err.message);
+        return;
+      }
+      
+      console.log('Event information received: ' + JSON.stringify(res.body));
+    });
 }
 
 // Do prep before building the email message.
